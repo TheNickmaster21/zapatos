@@ -5,7 +5,7 @@ Released under the MIT licence: see LICENCE file
 */
 
 import type {
-  SelectableForTable,
+  JSONSelectableForTable,
   WhereableForTable,
   InsertableForTable,
   UpdatableForTable,
@@ -22,7 +22,6 @@ import type {
 import {
   AllType,
   all,
-  DateString,
   SQL,
   SQLFragment,
   sql,
@@ -39,12 +38,6 @@ import {
   PromisedType,
 } from './utils';
 
-
-type JSONSelectableForTable<T extends Table> = { [K in keyof SelectableForTable<T>]:
-  Date extends SelectableForTable<T>[K] ? Exclude<SelectableForTable<T>[K], Date> | DateString :
-  Date[] extends SelectableForTable<T>[K] ? Exclude<SelectableForTable<T>[K], Date[]> | DateString[] :
-  SelectableForTable<T>[K]
-};
 
 export type JSONOnlyColsForTable<T extends Table, C extends any[] /* `ColumnForTable<T>[]` gives errors here for reasons I haven't got to the bottom of */> =
   Pick<JSONSelectableForTable<T>, C[number]>;
@@ -161,88 +154,122 @@ export class Constraint<T extends Table> { constructor(public value: UniqueIndex
 export function constraint<T extends Table>(x: UniqueIndexForTable<T>) { return new Constraint<T>(x); }
 
 export interface UpsertAction { $action: 'INSERT' | 'UPDATE' }
-type UpsertReturnableForTable<T extends Table, C extends ColumnForTable<T>[] | undefined, E extends SQLFragmentsMap | undefined> = ReturningTypeForTable<T, C, E> & UpsertAction;
-type UpsertConflictTargetForTable<T extends Table> = Constraint<T> | ColumnForTable<T> | ColumnForTable<T>[];
 
-interface UpsertOptions<T extends Table, C extends ColumnForTable<T>[] | undefined, E extends SQLFragmentsMap | undefined> extends ReturningOptionsForTable<T, C, E> {
-  updateColumns?: ColumnForTable<T> | ColumnForTable<T>[];
+type UpsertReportAction = 'suppress';
+type UpsertReturnableForTable<
+  T extends Table,
+  C extends ColumnForTable<T>[] | undefined,
+  E extends SQLFragmentsMap | undefined,
+  RA extends UpsertReportAction | undefined
+  > =
+  ReturningTypeForTable<T, C, E> & (undefined extends RA ? UpsertAction : {});
+
+type UpsertConflictTargetForTable<T extends Table> = Constraint<T> | ColumnForTable<T> | ColumnForTable<T>[];
+type UpdateColumns<T extends Table> = ColumnForTable<T> | ColumnForTable<T>[];
+
+interface UpsertOptions<
+  T extends Table,
+  C extends ColumnForTable<T>[] | undefined,
+  E extends SQLFragmentsMap | undefined,
+  UC extends UpdateColumns<T> | undefined,
+  RA extends UpsertReportAction | undefined,
+  > extends ReturningOptionsForTable<T, C, E> {
+  updateValues?: UpdatableForTable<T>;
+  updateColumns?: UC;
   noNullUpdateColumns?: ColumnForTable<T> | ColumnForTable<T>[];
+  reportAction?: RA;
 }
 
 interface UpsertSignatures {
-  <T extends Table, C extends ColumnForTable<T>[] | undefined, E extends SQLFragmentsMap | undefined>(
+  <T extends Table,
+    C extends ColumnForTable<T>[] | undefined,
+    E extends SQLFragmentsMap | undefined,
+    UC extends UpdateColumns<T> | undefined,
+    RA extends UpsertReportAction | undefined
+    >(
     table: T,
     values: InsertableForTable<T>,
     conflictTarget: UpsertConflictTargetForTable<T>,
-    options?: UpsertOptions<T, C, E>
-  ): SQLFragment<UpsertReturnableForTable<T, C, E>>;
+    options?: UpsertOptions<T, C, E, UC, RA>
+  ): SQLFragment<UpsertReturnableForTable<T, C, E, RA> | (UC extends never[] ? undefined : never)>;
 
-  <T extends Table, C extends ColumnForTable<T>[] | undefined, E extends SQLFragmentsMap | undefined>(
+  <T extends Table,
+    C extends ColumnForTable<T>[] | undefined,
+    E extends SQLFragmentsMap | undefined,
+    UC extends UpdateColumns<T> | undefined,
+    RA extends UpsertReportAction | undefined
+    >(
     table: T,
     values: InsertableForTable<T>[],
     conflictTarget: UpsertConflictTargetForTable<T>,
-    options?: UpsertOptions<T, C, E>
-  ): SQLFragment<UpsertReturnableForTable<T, C, E>[]>;
+    options?: UpsertOptions<T, C, E, UC, RA>
+  ): SQLFragment<UpsertReturnableForTable<T, C, E, RA>[]>;
 }
+
+export const doNothing = [];
 
 /**
  * Generate an 'upsert' (`INSERT ... ON CONFLICT ...`) query `SQLFragment`.
  * @param table The table to update or insert into
  * @param values An `Insertable` of values (or an array thereof) to be inserted 
  * or updated
- * @param conflictTarget A `UNIQUE` index or `UNIQUE`-indexed column (or array
- * thereof) that determines whether this is an `UPDATE` (when there's a matching
- * existing value) or an `INSERT` (when there isn't)
- * @param noNullUpdateCols Optionally, a column (or array thereof) that should 
- * not be overwritten with `NULL` values during an update
+ * @param conflictTarget A `UNIQUE`-indexed column (or array thereof) or a 
+ * `UNIQUE` index (wrapped in `db.constraint(...)`) that determines whether we
+ * get an `UPDATE` (when there's a matching existing value) or an `INSERT`
+ * (when there isn't)
+ * @param options Optionally, an object with any of the keys `updateColumns`,
+ * `noNullUpdateColumns` and `updateValues` (see documentation).
  */
 export const upsert: UpsertSignatures = function (
   table: Table,
   values: Insertable | Insertable[],
   conflictTarget: Column | Column[] | Constraint<Table>,
-  options?: UpsertOptions<Table, Column[] | undefined, SQLFragmentsMap | undefined>
+  options?: UpsertOptions<Table, Column[] | undefined, SQLFragmentsMap | undefined, UpdateColumns<Table>, UpsertReportAction>
 ): SQLFragment<any> {
 
   if (Array.isArray(values) && values.length === 0) return insert(table, values);  // punt a no-op to plain insert
-
   if (typeof conflictTarget === 'string') conflictTarget = [conflictTarget];  // now either Column[] or Constraint
 
   let noNullUpdateColumns = options?.noNullUpdateColumns ?? [];
   if (!Array.isArray(noNullUpdateColumns)) noNullUpdateColumns = [noNullUpdateColumns];
 
-  let updateColumns = options?.updateColumns;
-  if (updateColumns && !Array.isArray(updateColumns)) updateColumns = [updateColumns];
+  let specifiedUpdateColumns = options?.updateColumns;
+  if (specifiedUpdateColumns && !Array.isArray(specifiedUpdateColumns)) specifiedUpdateColumns = [specifiedUpdateColumns];
 
   const
-    completedValues = Array.isArray(values) ? completeKeysWithDefaultValue(values, Default) : values,
-    firstRow = Array.isArray(completedValues) ? completedValues[0] : completedValues,
-    colsSQL = cols(firstRow),
-    valuesSQL = Array.isArray(completedValues) ?
-      mapWithSeparator(completedValues as Insertable[], sql`, `, v => sql`(${vals(v)})`) :
-      sql`(${vals(completedValues)})`,
+    completedValues = Array.isArray(values) ? completeKeysWithDefaultValue(values, Default) : [values],
+    firstRow = completedValues[0],
+    insertColsSQL = cols(firstRow),
+    insertValuesSQL = mapWithSeparator(completedValues, sql`, `, v => sql`(${vals(v)})`),
     colNames = Object.keys(firstRow) as Column[],
-    nonUniqueCols = updateColumns as string[] ?? (
-      Array.isArray(conflictTarget) ?
-        colNames.filter(v => !(conflictTarget as Column[]).includes(v)) :
-        colNames
-    ),
-    uniqueColsSQL = Array.isArray(conflictTarget) ?
-      sql`(${mapWithSeparator(conflictTarget.slice().sort(), sql`, `, c => c)})` :
+    updateColumns = specifiedUpdateColumns as string[] ?? colNames,
+    conflictTargetSQL = Array.isArray(conflictTarget) ?
+      sql`(${mapWithSeparator(conflictTarget, sql`, `, c => c)})` :
       sql<string>`ON CONSTRAINT ${conflictTarget.value}`,
-    updateColsSQL = mapWithSeparator(nonUniqueCols.slice().sort(), sql`, `, c => c),
-    updateValuesSQL = mapWithSeparator(nonUniqueCols.slice().sort(), sql`, `, c =>
-      noNullUpdateColumns.includes(c) ? sql`CASE WHEN EXCLUDED.${c} IS NULL THEN ${table}.${c} ELSE EXCLUDED.${c} END` : sql`EXCLUDED.${c}`),
+    updateColsSQL = mapWithSeparator(updateColumns, sql`, `, c => c),
+    updateValues = options?.updateValues ?? {},
+    updateValuesSQL = mapWithSeparator(updateColumns, sql`, `, c =>
+      updateValues[c] !== undefined ? updateValues[c] :
+        noNullUpdateColumns.includes(c) ? sql`CASE WHEN EXCLUDED.${c} IS NULL THEN ${table}.${c} ELSE EXCLUDED.${c} END` :
+          sql`EXCLUDED.${c}`),
     returningSQL = SQLForColumnsOfTable(options?.returning, table),
-    extrasSQL = SQLForExtras(options?.extras);
+    extrasSQL = SQLForExtras(options?.extras),
+    suppressReport = options?.reportAction === 'suppress';
 
   // the added-on $action = 'INSERT' | 'UPDATE' key takes after SQL Server's approach to MERGE
   // (and on the use of xmax for this purpose, see: https://stackoverflow.com/questions/39058213/postgresql-upsert-differentiate-inserted-and-updated-rows-using-system-columns-x)
 
-  const query = sql`INSERT INTO ${table} (${colsSQL}) VALUES ${valuesSQL} ON CONFLICT ${uniqueColsSQL} DO UPDATE SET (${updateColsSQL}) = ROW(${updateValuesSQL}) RETURNING ${returningSQL}${extrasSQL} || jsonb_build_object('$action', CASE xmax WHEN 0 THEN 'INSERT' ELSE 'UPDATE' END) AS result`;
+  const
+    insertPart = sql`INSERT INTO ${table} (${insertColsSQL}) VALUES ${insertValuesSQL}`,
+    conflictPart = sql`ON CONFLICT ${conflictTargetSQL} DO`,
+    conflictActionPart = updateColsSQL.length > 0 ? sql`UPDATE SET (${updateColsSQL}) = ROW(${updateValuesSQL})` : sql`NOTHING`,
+    reportPart = sql` || jsonb_build_object('$action', CASE xmax WHEN 0 THEN 'INSERT' ELSE 'UPDATE' END)`,
+    returningPart = sql`RETURNING ${returningSQL}${extrasSQL}${suppressReport ? [] : reportPart} AS result`,
+    query = sql`${insertPart} ${conflictPart} ${conflictActionPart} ${returningPart}`;
 
-  query.runResultTransform = Array.isArray(completedValues) ?
+  query.runResultTransform = Array.isArray(values) ?
     (qr) => qr.rows.map(r => r.result) :
-    (qr) => qr.rows[0].result;
+    (qr) => qr.rows[0]?.result;
 
   return query;
 };
